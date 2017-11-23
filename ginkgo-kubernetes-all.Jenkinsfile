@@ -33,14 +33,14 @@ pipeline {
 
     environment {
         PROJ_PATH = "src/github.com/cilium/cilium"
-        MEMORY = "3072"
+        MEMORY = "4096"
         TESTDIR="${WORKSPACE}/${PROJ_PATH}/test"
         GOPATH="${WORKSPACE}"
         SERVER_BOX = "cilium/ubuntu"
     }
 
     options {
-        timeout(time: 240, unit: 'MINUTES')
+        timeout(time: 300, unit: 'MINUTES')
         timestamps()
         ansiColor('xterm')
     }
@@ -74,7 +74,7 @@ pipeline {
                 CONTAINER_RUNTIME=setIfLabel("area/containerd", "containerd", "docker")
             }
             options {
-                timeout(time: 90, unit: 'MINUTES')
+                timeout(time: 150, unit: 'MINUTES')
             }
             steps {
                 parallel(
@@ -117,7 +117,7 @@ pipeline {
                 CONTAINER_RUNTIME=setIfLabel("area/containerd", "containerd", "docker")
             }
             options {
-                timeout(time: 90, unit: 'MINUTES')
+                timeout(time: 150, unit: 'MINUTES')
             }
             steps {
                 parallel(
