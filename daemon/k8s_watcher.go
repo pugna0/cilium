@@ -1392,50 +1392,66 @@ func (d *Daemon) addCiliumNetworkPolicyV2(ciliumV2Store cache.Store, cnp *cilium
 						Warn("Error parsing new CiliumNetworkPolicy rule")
 				}
 
-				cnpns := cilium_v2.CiliumNetworkPolicyNodeStatus{
-					OK: true,
-					// If the deadline was reached then not all endpoints are enforcing
-					// the given policy.
-					Enforcing:   waitForEPsErr == nil,
-					Revision:    rev,
-					LastUpdated: cilium_v2.NewTimestamp(),
-					Annotations: cnp.Annotations,
+				var err3 error
+
+				// Update the status of whether the rule is enforced on this node.
+				// If we are unable to parse the CNP retrieved from the store,
+				// or if endpoints did not reach the desired policy revision
+				// after 30 seconds, then mark the rule as not being enforced.
+				if err2 != nil {
+					err3 = updateCNPNodeStatus(serverRuleCpy, false, err2, 0, cnp.Annotations)
+				} else {
+					// If the deadline by the above context, then not all
+					// endpoints are enforcing the given policy, and
+					// waitForEpsErr will be non-nil.
+					err3 = updateCNPNodeStatus(serverRuleCpy, waitForEPsErr == nil, nil, rev, cnp.Annotations)
 				}
 
-				// Most important is the error while adding the CNP
-				if err != nil {
-					cnpns = cilium_v2.CiliumNetworkPolicyNodeStatus{
-						Error:       err.Error(),
-						OK:          false,
-						LastUpdated: cilium_v2.NewTimestamp(),
-					}
-				} else if err2 != nil {
-					cnpns = cilium_v2.CiliumNetworkPolicyNodeStatus{
-						Error:       err2.Error(),
-						OK:          false,
-						LastUpdated: cilium_v2.NewTimestamp(),
-					}
-				}
-
-				nodeName := node.GetName()
-				serverRuleCpy.SetPolicyStatus(nodeName, cnpns)
-				ns := k8sUtils.ExtractNamespace(&serverRuleCpy.ObjectMeta)
-
-				switch {
-				case ciliumUpdateStatusVerConstr.Check(k8sServerVer):
-					_, err2 = ciliumNPClient.CiliumV2().CiliumNetworkPolicies(ns).UpdateStatus(serverRuleCpy)
-				default:
-					_, err2 = ciliumNPClient.CiliumV2().CiliumNetworkPolicies(ns).Update(serverRuleCpy)
-				}
-				if err2 == nil {
+				if err3 == nil {
 					scopedLog.WithField("status", serverRuleCpy.Status).Debug("successfully updated with status")
 				} else {
-					return err2
+					return err3
 				}
+
 				return waitForEPsErr
 			},
 		},
 	)
+}
+
+func updateCNPNodeStatus(cnp *cilium_v2.CiliumNetworkPolicy, enforcing bool, err error, rev uint64, annotations map[string]string) error {
+	var (
+		cnpns cilium_v2.CiliumNetworkPolicyNodeStatus
+		err2  error
+	)
+	if err != nil {
+		cnpns = cilium_v2.CiliumNetworkPolicyNodeStatus{
+			Enforcing:   enforcing,
+			Error:       err.Error(),
+			OK:          false,
+			LastUpdated: cilium_v2.NewTimestamp(),
+		}
+	} else {
+		cnpns = cilium_v2.CiliumNetworkPolicyNodeStatus{
+			Enforcing:   enforcing,
+			Revision:    rev,
+			OK:          true,
+			LastUpdated: cilium_v2.NewTimestamp(),
+			Annotations: annotations,
+		}
+	}
+
+	nodeName := node.GetName()
+	cnp.SetPolicyStatus(nodeName, cnpns)
+	ns := k8sUtils.ExtractNamespace(&cnp.ObjectMeta)
+
+	switch {
+	case ciliumUpdateStatusVerConstr.Check(k8sServerVer):
+		_, err2 = ciliumNPClient.CiliumV2().CiliumNetworkPolicies(ns).UpdateStatus(cnp)
+	default:
+		_, err2 = ciliumNPClient.CiliumV2().CiliumNetworkPolicies(ns).Update(cnp)
+	}
+	return err2
 }
 
 func (d *Daemon) deleteCiliumNetworkPolicyV2(cnp *cilium_v2.CiliumNetworkPolicy) {
@@ -1473,7 +1489,7 @@ func (d *Daemon) deleteCiliumNetworkPolicyV2(cnp *cilium_v2.CiliumNetworkPolicy)
 
 func updateRuleAnnotations(ciliumV2Store cache.Store, cnp *cilium_v2.CiliumNetworkPolicy) error {
 
-	serverRule, err := getUpdatedCNPFromStore(ciliumV2Store, cnp)
+	updatedCNPFromStore, err := getUpdatedCNPFromStore(ciliumV2Store, cnp)
 	if err != nil {
 		return err
 	}
@@ -1481,27 +1497,30 @@ func updateRuleAnnotations(ciliumV2Store cache.Store, cnp *cilium_v2.CiliumNetwo
 	// Make a copy since the rule is a pointer, and any of its fields
 	// which are also pointers could be modified outside of this
 	// function.
-	serverRuleCpy := serverRule.DeepCopy()
+	updatedCNPFromStoreCopy := updatedCNPFromStore.DeepCopy()
 
 	// Only update annotations for node on which this agent is running.
 	nodeName := node.GetName()
-	cnpns := serverRuleCpy.GetPolicyStatus(nodeName)
-	cnpns.Annotations = serverRuleCpy.Annotations
+	cnpNodeStatus := cnp.GetPolicyStatus(nodeName)
+	updatedCNPFromStoreNodeStatus := updatedCNPFromStoreCopy.GetPolicyStatus(nodeName)
 
 	// Do not update annotations if policy rule is not enforced on the node.
-	if !cnpns.Enforcing {
+	if !updatedCNPFromStoreNodeStatus.Enforcing {
 		return fmt.Errorf("policy has not been enforced; not updating annotations")
 	}
 
+	var cnpErr error
+	if cnpNodeStatus.Error != "" {
+		cnpErr = fmt.Errorf(cnpNodeStatus.Error)
+	}
+
 	// Update server with updated rule with new annotations.
-	serverRuleCpy.SetPolicyStatus(nodeName, cnpns)
-	ns := k8sUtils.ExtractNamespace(&serverRuleCpy.ObjectMeta)
-	_, err = ciliumNPClient.CiliumV2().CiliumNetworkPolicies(ns).Update(serverRuleCpy)
+	err = updateCNPNodeStatus(updatedCNPFromStoreCopy, cnpNodeStatus.Enforcing, cnpErr, cnpNodeStatus.Revision, cnp.Annotations)
 	if err != nil {
 		return err
 	}
 
-	log.WithField("rule", logfields.Repr(serverRuleCpy)).Debug("rule had no policy changes, but had annotation changes; successfully updated annotations of rule")
+	log.WithField("rule", logfields.Repr(updatedCNPFromStoreCopy)).Debug("rule had no policy changes, but had annotation changes; successfully updated annotations of rule")
 
 	return nil
 }
